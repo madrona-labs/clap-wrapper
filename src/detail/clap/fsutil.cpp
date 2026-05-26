@@ -109,7 +109,7 @@ std::vector<fs::path> getValidCLAPSearchPaths()
   }
   auto sep = ':';
 
-  if (cp.empty())
+  if (!cp.empty())
   {
     size_t pos;
     while ((pos = cp.find(sep)) != std::string::npos)
