@@ -272,6 +272,8 @@ class WrapAsAUV2 : public ausdk::AUBase,
  protected:
   UInt32 GetAudioChannelLayout(AudioUnitScope scope, AudioUnitElement element,
                                AudioChannelLayout *outLayoutPtr, bool &outWritable) override;
+  std::vector<AudioChannelLayoutTag> GetChannelLayoutTags(AudioUnitScope scope,
+                                                          AudioUnitElement element) override;
 
  public:
   bool CanScheduleParameters() const override
