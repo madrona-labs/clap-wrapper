@@ -761,7 +761,56 @@ ARAPlugInExtensionInstancePtr PLUGIN_API ClapAsVst3::bindToDocumentControllerWit
   return nullptr;
 }
 
-// TODO: surround extension support
+// maps a single CLAP surround channel identifier to the corresponding VST3 speaker bit
+static Vst::Speaker vst3SpeakerFromClapSurround(uint8_t channel)
+{
+  switch (channel)
+  {
+    case CLAP_SURROUND_FL:
+      return Vst::kSpeakerL;
+    case CLAP_SURROUND_FR:
+      return Vst::kSpeakerR;
+    case CLAP_SURROUND_FC:
+      return Vst::kSpeakerC;
+    case CLAP_SURROUND_LFE:
+      return Vst::kSpeakerLfe;
+    case CLAP_SURROUND_BL:
+      return Vst::kSpeakerLs;
+    case CLAP_SURROUND_BR:
+      return Vst::kSpeakerRs;
+    case CLAP_SURROUND_FLC:
+      return Vst::kSpeakerLc;
+    case CLAP_SURROUND_FRC:
+      return Vst::kSpeakerRc;
+    case CLAP_SURROUND_BC:
+      return Vst::kSpeakerCs;
+    case CLAP_SURROUND_SL:
+      return Vst::kSpeakerSl;
+    case CLAP_SURROUND_SR:
+      return Vst::kSpeakerSr;
+    case CLAP_SURROUND_TC:
+      return Vst::kSpeakerTc;
+    case CLAP_SURROUND_TFL:
+      return Vst::kSpeakerTfl;
+    case CLAP_SURROUND_TFC:
+      return Vst::kSpeakerTfc;
+    case CLAP_SURROUND_TFR:
+      return Vst::kSpeakerTfr;
+    case CLAP_SURROUND_TBL:
+      return Vst::kSpeakerTrl;
+    case CLAP_SURROUND_TBC:
+      return Vst::kSpeakerTrc;
+    case CLAP_SURROUND_TBR:
+      return Vst::kSpeakerTrr;
+    case CLAP_SURROUND_TSL:
+      return Vst::kSpeakerTsl;
+    case CLAP_SURROUND_TSR:
+      return Vst::kSpeakerTsr;
+    default:
+      return 0;
+  }
+}
+
 static Vst::SpeakerArrangement speakerArrFromPortType(const char *port_type, uint32_t channel_count)
 {
   if (!port_type)
@@ -803,9 +852,29 @@ static Vst::SpeakerArrangement speakerArrFromPortType(const char *port_type, uin
   return Vst::SpeakerArr::kEmpty;
 }
 
-void ClapAsVst3::addAudioBusFrom(const clap_audio_port_info_t *info, bool is_input)
+void ClapAsVst3::addAudioBusFrom(const clap_audio_port_info_t *info, uint32_t index, bool is_input)
 {
-  auto spk = speakerArrFromPortType(info->port_type, info->channel_count);
+  Vst::SpeakerArrangement spk;
+
+  // If the plugin exposes the surround extension and this port is a surround port,
+  // build the speaker arrangement from the per-channel map rather than guessing from
+  // the channel count. This is the only way to express e.g. quad (L/R/Ls/Rs) in VST3.
+  uint8_t channelmap[sizeof(Vst::SpeakerArrangement) * 8]{};
+  if (_plugin->_ext._surround && info->port_type && !strcmp(info->port_type, CLAP_PORT_SURROUND) &&
+      info->channel_count <= sizeof(channelmap))
+  {
+    auto count = _plugin->_ext._surround->get_channel_map(_plugin->_plugin, is_input, index, channelmap,
+                                                          info->channel_count);
+    spk = Vst::SpeakerArr::kEmpty;
+    for (uint32_t c = 0; c < count; ++c)
+    {
+      spk |= vst3SpeakerFromClapSurround(channelmap[c]);
+    }
+  }
+  else
+  {
+    spk = speakerArrFromPortType(info->port_type, info->channel_count);
+  }
 
   auto bustype = Vst::BusTypes::kMain;  // actually, everything is main, except
   if (is_input && !(info->flags & CLAP_AUDIO_PORT_IS_MAIN))
@@ -1001,7 +1070,7 @@ void ClapAsVst3::setupAudioBusses(const clap_plugin_t *plugin,
     clap_audio_port_info_t info;
     if (audioports->get(plugin, i, true, &info))
     {
-      addAudioBusFrom(&info, true);
+      addAudioBusFrom(&info, (uint32_t)i, true);
     }
   }
   for (decltype(numAudioOutputs) i = 0; i < numAudioOutputs; ++i)
@@ -1009,7 +1078,7 @@ void ClapAsVst3::setupAudioBusses(const clap_plugin_t *plugin,
     clap_audio_port_info_t info;
     if (audioports->get(plugin, i, false, &info))
     {
-      addAudioBusFrom(&info, false);
+      addAudioBusFrom(&info, (uint32_t)i, false);
     }
   }
 
