@@ -26,6 +26,7 @@
 
 #include "detail/clap/fsutil.h"
 #include <clap/ext/draft/gain-adjustment-metering.h>
+#include <clap/ext/surround.h>
 
 namespace Clap
 {
@@ -109,6 +110,7 @@ struct ClapPluginExtensions
   const clap_plugin_audio_ports_t *_audioports = nullptr;
   const clap_plugin_audio_ports_activation_t *_audioportsactivation = nullptr;
   const clap_plugin_configurable_audio_ports_t *_configaudioports = nullptr;
+  const clap_plugin_surround_t *_surround = nullptr;
   const clap_plugin_gui_t *_gui = nullptr;
   const clap_plugin_note_ports_t *_noteports = nullptr;
   const clap_plugin_latency_t *_latency = nullptr;
