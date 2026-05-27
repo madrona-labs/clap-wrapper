@@ -371,6 +371,96 @@ tresult PLUGIN_API ClapAsVst3::setProcessing(TBool state)
   return result;
 }
 
+// inverse of vst3SpeakerFromClapSurround: a single VST3 speaker bit -> CLAP surround
+// channel identifier, or -1 if the speaker has no CLAP equivalent.
+static int clapSurroundChannelFromVst3Speaker(Vst::Speaker speaker)
+{
+  switch (speaker)
+  {
+    case Vst::kSpeakerL:
+      return CLAP_SURROUND_FL;
+    case Vst::kSpeakerR:
+      return CLAP_SURROUND_FR;
+    case Vst::kSpeakerC:
+      return CLAP_SURROUND_FC;
+    case Vst::kSpeakerLfe:
+      return CLAP_SURROUND_LFE;
+    case Vst::kSpeakerLs:
+      return CLAP_SURROUND_BL;
+    case Vst::kSpeakerRs:
+      return CLAP_SURROUND_BR;
+    case Vst::kSpeakerLc:
+      return CLAP_SURROUND_FLC;
+    case Vst::kSpeakerRc:
+      return CLAP_SURROUND_FRC;
+    case Vst::kSpeakerCs:
+      return CLAP_SURROUND_BC;
+    case Vst::kSpeakerSl:
+      return CLAP_SURROUND_SL;
+    case Vst::kSpeakerSr:
+      return CLAP_SURROUND_SR;
+    case Vst::kSpeakerTc:
+      return CLAP_SURROUND_TC;
+    case Vst::kSpeakerTfl:
+      return CLAP_SURROUND_TFL;
+    case Vst::kSpeakerTfc:
+      return CLAP_SURROUND_TFC;
+    case Vst::kSpeakerTfr:
+      return CLAP_SURROUND_TFR;
+    case Vst::kSpeakerTrl:
+      return CLAP_SURROUND_TBL;
+    case Vst::kSpeakerTrc:
+      return CLAP_SURROUND_TBC;
+    case Vst::kSpeakerTrr:
+      return CLAP_SURROUND_TBR;
+    case Vst::kSpeakerTsl:
+      return CLAP_SURROUND_TSL;
+    case Vst::kSpeakerTsr:
+      return CLAP_SURROUND_TSR;
+    default:
+      return -1;
+  }
+}
+
+// Builds the ordered CLAP surround channel map (and its equivalent channel mask) from a
+// VST3 speaker arrangement. Channels are emitted in ascending speaker-bit order, which is
+// the channel order VST3 uses within a bus. Returns false if any speaker bit has no CLAP
+// surround equivalent (in which case the arrangement cannot be expressed as surround).
+static bool clapSurroundChannelMapFromVst3(Vst::SpeakerArrangement arr, std::vector<uint8_t> &outMap,
+                                           uint64_t &outMask)
+{
+  outMap.clear();
+  outMask = 0;
+  for (int bit = 0; bit < 64; ++bit)
+  {
+    auto speaker = (Vst::Speaker)(uint64_t(1) << bit);
+    if (arr & speaker)
+    {
+      auto ch = clapSurroundChannelFromVst3Speaker(speaker);
+      if (ch < 0) return false;
+      outMap.push_back((uint8_t)ch);
+      outMask |= (uint64_t(1) << ch);
+    }
+  }
+  return true;
+}
+
+// True if the plugin accepts the given VST3 arrangement on this port. For a surround port
+// with the surround extension, the exact channel mask is validated via
+// is_channel_mask_supported(); otherwise we fall back to a plain channel-count match.
+static bool clapAcceptsVst3Arrangement(const Clap::Plugin *plugin, Vst::SpeakerArrangement arr,
+                                       const clap_audio_port_info_t &info)
+{
+  if (plugin->_ext._surround && info.port_type && !strcmp(info.port_type, CLAP_PORT_SURROUND))
+  {
+    std::vector<uint8_t> map;
+    uint64_t mask = 0;
+    if (!clapSurroundChannelMapFromVst3(arr, map, mask)) return false;
+    return plugin->_ext._surround->is_channel_mask_supported(plugin->_plugin, mask);
+  }
+  return static_cast<uint32_t>(Vst::SpeakerArr::getChannelCount(arr)) == info.channel_count;
+}
+
 tresult PLUGIN_API ClapAsVst3::setBusArrangements(Vst::SpeakerArrangement *inputs, int32 numIns,
                                                   Vst::SpeakerArrangement *outputs, int32 numOuts)
 {
@@ -385,6 +475,11 @@ tresult PLUGIN_API ClapAsVst3::setBusArrangements(Vst::SpeakerArrangement *input
   if (_plugin->_ext._configurable_audio_ports)
   {
     std::vector<clap_audio_port_configuration_request_t> requests;
+    // Backing storage for the surround channel maps referenced by request.port_details.
+    // Reserved up front so the vectors don't move and invalidate those pointers.
+    std::vector<std::vector<uint8_t>> channelMaps;
+    requests.reserve(numIns + numOuts);
+    channelMaps.reserve(numIns + numOuts);
 
     for (int i = 0; i < numIns + numOuts; ++i)
     {
@@ -393,6 +488,8 @@ tresult PLUGIN_API ClapAsVst3::setBusArrangements(Vst::SpeakerArrangement *input
       request.is_input = i < numIns;
       request.port_index = i < numIns ? i : (i - numIns);
       auto arrangement = i < numIns ? inputs[i] : outputs[i - numIns];
+
+      auto &channelMap = channelMaps.emplace_back();
 
       switch (arrangement)
       {
@@ -410,6 +507,20 @@ tresult PLUGIN_API ClapAsVst3::setBusArrangements(Vst::SpeakerArrangement *input
           request.channel_count = static_cast<uint32_t>(Vst::SpeakerArr::getChannelCount(arrangement));
           request.port_type = nullptr;
           request.port_details = nullptr;
+          // If the plugin supports the surround extension and accepts this arrangement
+          // as a channel mask, request a surround port with an explicit channel map so
+          // the plugin lays out the exact channels (e.g. quad L/R/Ls/Rs) rather than an
+          // unspecified N-channel port.
+          if (_plugin->_ext._surround)
+          {
+            uint64_t mask = 0;
+            if (clapSurroundChannelMapFromVst3(arrangement, channelMap, mask) &&
+                _plugin->_ext._surround->is_channel_mask_supported(_plugin->_plugin, mask))
+            {
+              request.port_type = CLAP_PORT_SURROUND;
+              request.port_details = channelMap.data();
+            }
+          }
           break;
       }
 
@@ -434,16 +545,14 @@ tresult PLUGIN_API ClapAsVst3::setBusArrangements(Vst::SpeakerArrangement *input
     {
       clap_audio_port_info_t info;
       _plugin->_ext._audioports->get(_plugin->_plugin, i, true, &info);
-      if (static_cast<uint32_t>(Vst::SpeakerArr::getChannelCount(inputs[i])) != info.channel_count)
-        return kResultFalse;
+      if (!clapAcceptsVst3Arrangement(_plugin.get(), inputs[i], info)) return kResultFalse;
     }
 
     for (int i = 0; i < numOuts; ++i)
     {
       clap_audio_port_info_t info;
       _plugin->_ext._audioports->get(_plugin->_plugin, i, false, &info);
-      if (static_cast<uint32_t>(Vst::SpeakerArr::getChannelCount(outputs[i])) != info.channel_count)
-        return kResultFalse;
+      if (!clapAcceptsVst3Arrangement(_plugin.get(), outputs[i], info)) return kResultFalse;
     }
   }
 
