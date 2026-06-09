@@ -1530,6 +1530,46 @@ static AudioChannelLabel auv2ChannelLabelFromClapSurround(uint8_t channel)
   }
 }
 
+#include <AudioToolbox/AudioFormat.h>
+
+// true when `labels` matches the canonical channel order CoreAudio defines for `tag`
+static bool auv2ChannelMapMatchesTag(AudioChannelLayoutTag tag, const AudioChannelLabel *labels,
+                                     uint32_t count)
+{
+  if (tag == kAudioChannelLayoutTag_UseChannelDescriptions ||
+      (tag & 0xFFFF0000U) == kAudioChannelLayoutTag_DiscreteInOrder)
+  {
+    return false;
+  }
+
+  // the specifier for ChannelLayoutForTag is the bare tag, not an AudioChannelLayout
+  UInt32 size = 0;
+  if (AudioFormatGetPropertyInfo(kAudioFormatProperty_ChannelLayoutForTag, sizeof(tag), &tag,
+                                 &size) != noErr)
+  {
+    return false;
+  }
+  std::vector<uint8_t> buffer(size);
+  auto *canonical = reinterpret_cast<AudioChannelLayout *>(buffer.data());
+  if (AudioFormatGetProperty(kAudioFormatProperty_ChannelLayoutForTag, sizeof(tag), &tag, &size,
+                             canonical) != noErr)
+  {
+    return false;
+  }
+  if (canonical->mNumberChannelDescriptions != count)
+  {
+    return false;
+  }
+  for (uint32_t i = 0; i < count; ++i)
+  {
+    if (canonical->mChannelDescriptions[i].mChannelLabel != labels[i])
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
 // best-matching CoreAudio layout tag for a plain channel count
 static AudioChannelLayoutTag auv2LayoutTagForChannelCount(uint32_t channel_count)
 {
@@ -1574,6 +1614,28 @@ UInt32 WrapAsAUV2::GetAudioChannelLayout(AudioUnitScope scope, AudioUnitElement 
     {
       auto count = _plugin->_ext._surround->get_channel_map(_plugin->_plugin, is_input, element,
                                                             channelmap, info.channel_count);
+
+      AudioChannelLabel labels[32]{};
+      for (uint32_t c = 0; c < count; ++c)
+      {
+        labels[c] = auv2ChannelLabelFromClapSurround(channelmap[c]);
+      }
+
+      // auval requires the default layout to be one of the tags published by
+      // GetChannelLayoutTags, so return the concrete tag whenever the CLAP
+      // channel map matches its canonical order; descriptions only otherwise.
+      const auto tag = auv2LayoutTagForChannelCount(count);
+      if (auv2ChannelMapMatchesTag(tag, labels, count))
+      {
+        auto size = (UInt32)offsetof(AudioChannelLayout, mChannelDescriptions);
+        if (outLayoutPtr)
+        {
+          memset(outLayoutPtr, 0, size);
+          outLayoutPtr->mChannelLayoutTag = tag;
+        }
+        return size;
+      }
+
       auto size = (UInt32)(offsetof(AudioChannelLayout, mChannelDescriptions) +
                            count * sizeof(AudioChannelDescription));
       if (outLayoutPtr)
@@ -1583,8 +1645,7 @@ UInt32 WrapAsAUV2::GetAudioChannelLayout(AudioUnitScope scope, AudioUnitElement 
         outLayoutPtr->mNumberChannelDescriptions = count;
         for (uint32_t c = 0; c < count; ++c)
         {
-          outLayoutPtr->mChannelDescriptions[c].mChannelLabel =
-              auv2ChannelLabelFromClapSurround(channelmap[c]);
+          outLayoutPtr->mChannelDescriptions[c].mChannelLabel = labels[c];
         }
       }
       return size;
