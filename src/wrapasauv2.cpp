@@ -4,6 +4,7 @@
 #include <limits>
 #include <cassert>
 #include <Block.h>
+#include <AudioToolbox/AudioFormat.h>
 
 extern bool fillAudioUnitCocoaView(AudioUnitCocoaViewInfo *viewInfo, std::shared_ptr<Clap::Plugin>);
 
@@ -1700,8 +1701,46 @@ static AudioChannelLabel auv2ChannelLabelFromClapSurround(uint8_t channel)
   }
 }
 
-// best-matching CoreAudio layout tag for a plain channel count
-static AudioChannelLayoutTag auv2LayoutTagForChannelCount(uint32_t channel_count)
+// true when `labels` matches the canonical channel order CoreAudio defines for `tag`
+static bool auv2ChannelMapMatchesTag(AudioChannelLayoutTag tag, const AudioChannelLabel *labels,
+                                     uint32_t count)
+{
+  if (tag == kAudioChannelLayoutTag_UseChannelDescriptions ||
+      (tag & 0xFFFF0000U) == kAudioChannelLayoutTag_DiscreteInOrder)
+  {
+    return false;
+  }
+
+  // the specifier for ChannelLayoutForTag is the bare tag, not an AudioChannelLayout
+  UInt32 size = 0;
+  if (AudioFormatGetPropertyInfo(kAudioFormatProperty_ChannelLayoutForTag, sizeof(tag), &tag, &size) !=
+      noErr)
+  {
+    return false;
+  }
+  std::vector<uint8_t> buffer(size);
+  auto *canonical = reinterpret_cast<AudioChannelLayout *>(buffer.data());
+  if (AudioFormatGetProperty(kAudioFormatProperty_ChannelLayoutForTag, sizeof(tag), &tag, &size,
+                             canonical) != noErr)
+  {
+    return false;
+  }
+  if (canonical->mNumberChannelDescriptions != count)
+  {
+    return false;
+  }
+  for (uint32_t i = 0; i < count; ++i)
+  {
+    if (canonical->mChannelDescriptions[i].mChannelLabel != labels[i])
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
+// the tag AU hosts expect for a channel count, used only if the plugin's order matches it
+static AudioChannelLayoutTag auv2PreferredLayoutTagForChannelCount(uint32_t channel_count)
 {
   switch (channel_count)
   {
@@ -1724,65 +1763,89 @@ static AudioChannelLayoutTag auv2LayoutTagForChannelCount(uint32_t channel_count
   }
 }
 
-UInt32 WrapAsAUV2::GetAudioChannelLayout(AudioUnitScope scope, AudioUnitElement element,
-                                         AudioChannelLayout *outLayoutPtr, bool &outWritable)
+// GetAudioChannelLayout and GetChannelLayoutTags both resolve the tag here, so a port's
+// reported layout is always one of its published tags -- auval rejects it otherwise
+static AudioChannelLayoutTag auv2LayoutTagForChannelMap(const AudioChannelLabel *labels, uint32_t count)
 {
-  outWritable = false;
+  const auto preferred = auv2PreferredLayoutTagForChannelCount(count);
+  if (auv2ChannelMapMatchesTag(preferred, labels, count)) return preferred;
 
-  // Only report a layout when the plugin exposes the surround extension for this
-  // port; otherwise defer to the base class (unchanged behavior for mono/stereo).
-  auto ap = _plugin->_ext._audioports;
-  if (ap && _plugin->_ext._surround &&
-      (scope == kAudioUnitScope_Input || scope == kAudioUnitScope_Output))
+  UInt32 size = 0;
+  if (AudioFormatGetPropertyInfo(kAudioFormatProperty_TagsForNumberOfChannels, sizeof(count), &count,
+                                 &size) == noErr)
   {
-    const bool is_input = (scope == kAudioUnitScope_Input);
-    clap_audio_port_info_t info;
-    uint8_t channelmap[32]{};
-    if (ap->get(_plugin->_plugin, element, is_input, &info) && info.port_type &&
-        !strcmp(info.port_type, CLAP_PORT_SURROUND) && info.channel_count > 0 &&
-        info.channel_count <= sizeof(channelmap))
+    std::vector<AudioChannelLayoutTag> tags(size / sizeof(AudioChannelLayoutTag));
+    if (AudioFormatGetProperty(kAudioFormatProperty_TagsForNumberOfChannels, sizeof(count), &count,
+                               &size, tags.data()) == noErr)
     {
-      auto count = _plugin->_ext._surround->get_channel_map(_plugin->_plugin, is_input, element,
-                                                            channelmap, info.channel_count);
-      auto size = (UInt32)(offsetof(AudioChannelLayout, mChannelDescriptions) +
-                           count * sizeof(AudioChannelDescription));
-      if (outLayoutPtr)
+      for (auto tag : tags)
       {
-        memset(outLayoutPtr, 0, size);
-        outLayoutPtr->mChannelLayoutTag = kAudioChannelLayoutTag_UseChannelDescriptions;
-        outLayoutPtr->mNumberChannelDescriptions = count;
-        for (uint32_t c = 0; c < count; ++c)
-        {
-          outLayoutPtr->mChannelDescriptions[c].mChannelLabel =
-              auv2ChannelLabelFromClapSurround(channelmap[c]);
-        }
+        if (auv2ChannelMapMatchesTag(tag, labels, count)) return tag;
       }
-      return size;
     }
   }
 
-  return Base::GetAudioChannelLayout(scope, element, outLayoutPtr, outWritable);
+  // no standard layout has this channel order, so don't claim one
+  return kAudioChannelLayoutTag_DiscreteInOrder | count;
+}
+
+// returns 0 if this isn't a surround port we can describe, leaving the layout to the base class
+static uint32_t auv2SurroundChannelLabels(const std::shared_ptr<Clap::Plugin> &plugin,
+                                          AudioUnitScope scope, AudioUnitElement element,
+                                          AudioChannelLabel *labels, uint32_t capacity)
+{
+  auto ap = plugin->_ext._audioports;
+  if (!ap || !plugin->_ext._surround) return 0;
+  if (scope != kAudioUnitScope_Input && scope != kAudioUnitScope_Output) return 0;
+
+  const bool is_input = (scope == kAudioUnitScope_Input);
+  clap_audio_port_info_t info;
+  if (!ap->get(plugin->_plugin, element, is_input, &info)) return 0;
+  if (!info.port_type || strcmp(info.port_type, CLAP_PORT_SURROUND)) return 0;
+
+  uint8_t channelmap[32]{};
+  if (info.channel_count == 0 || info.channel_count > sizeof(channelmap) ||
+      info.channel_count > capacity)
+  {
+    return 0;
+  }
+
+  auto count = plugin->_ext._surround->get_channel_map(plugin->_plugin, is_input, element, channelmap,
+                                                       info.channel_count);
+  if (count > capacity) return 0;
+  for (uint32_t c = 0; c < count; ++c)
+  {
+    labels[c] = auv2ChannelLabelFromClapSurround(channelmap[c]);
+  }
+  return count;
+}
+
+UInt32 WrapAsAUV2::GetAudioChannelLayout(AudioUnitScope scope, AudioUnitElement element,
+                                         AudioChannelLayout *outLayoutPtr, bool &outWritable)
+{
+  AudioChannelLabel labels[32]{};
+  auto count = auv2SurroundChannelLabels(_plugin, scope, element, labels, 32);
+  if (count == 0) return Base::GetAudioChannelLayout(scope, element, outLayoutPtr, outWritable);
+
+  outWritable = false;
+  auto size = (UInt32)offsetof(AudioChannelLayout, mChannelDescriptions);
+  if (outLayoutPtr)
+  {
+    memset(outLayoutPtr, 0, size);
+    outLayoutPtr->mChannelLayoutTag = auv2LayoutTagForChannelMap(labels, count);
+  }
+  return size;
 }
 
 std::vector<AudioChannelLayoutTag> WrapAsAUV2::GetChannelLayoutTags(AudioUnitScope scope,
                                                                     AudioUnitElement element)
 {
-  // Advertise a concrete layout tag (e.g. Quadraphonic) for surround ports so the
-  // host can offer the layout; defer to the base class for everything else.
-  auto ap = _plugin->_ext._audioports;
-  if (ap && _plugin->_ext._surround &&
-      (scope == kAudioUnitScope_Input || scope == kAudioUnitScope_Output))
-  {
-    const bool is_input = (scope == kAudioUnitScope_Input);
-    clap_audio_port_info_t info;
-    if (ap->get(_plugin->_plugin, element, is_input, &info) && info.port_type &&
-        !strcmp(info.port_type, CLAP_PORT_SURROUND) && info.channel_count > 0)
-    {
-      return {auv2LayoutTagForChannelCount(info.channel_count)};
-    }
-  }
+  // hosts only offer a layout that is published here
+  AudioChannelLabel labels[32]{};
+  auto count = auv2SurroundChannelLabels(_plugin, scope, element, labels, 32);
+  if (count == 0) return Base::GetChannelLayoutTags(scope, element);
 
-  return Base::GetChannelLayoutTags(scope, element);
+  return {auv2LayoutTagForChannelMap(labels, count)};
 }
 
 void WrapAsAUV2::send(const Clap::AUv2::clap_multi_event_t &event)
