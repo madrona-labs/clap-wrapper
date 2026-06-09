@@ -1493,22 +1493,17 @@ void WrapAsAUV2::PostConstructor()
     auto numAudioInputs = ap->count(pl, true);
     auto numAudioOutputs = ap->count(pl, false);
 
+    // Base::PostConstructor() recreated the scope elements with default (stereo)
+    // stream formats, discarding what setupAudioBusses() applied during plugin
+    // init — so the name *and* format must be re-applied from the CLAP ports
+    // here, or any non-stereo port reports a 2ch default format and fails auval.
     SetNumberOfElements(kAudioUnitScope_Input, numAudioInputs);
     Inputs().SetNumberOfElements(numAudioInputs);
     for (int i = 0; i < numAudioInputs; ++i)
     {
       clap_audio_port_info inf;
       ap->get(pl, i, true, &inf);
-      auto b = CFStringCreateWithCString(nullptr, inf.name, kCFStringEncodingUTF8);
-      Inputs().GetElement(i)->SetName(b);
-
-      /*
-      AudioChannelLayout layout;
-      layout.mNumberChannelDescriptions = 1;
-      layout.mChannelLayoutTag = kAudioChannelLayoutTag_Stereo;
-      memset(&layout, 0, sizeof(layout));
-      Inputs().GetIOElement(i)->SetAudioChannelLayout(layout);
-      */
+      addAudioBusFrom(i, &inf, true);
     }
 
     SetNumberOfElements(kAudioUnitScope_Output, numAudioOutputs);
@@ -1517,16 +1512,7 @@ void WrapAsAUV2::PostConstructor()
     {
       clap_audio_port_info inf;
       ap->get(pl, i, false, &inf);
-      auto b = CFStringCreateWithCString(nullptr, inf.name, kCFStringEncodingUTF8);
-      Outputs().GetElement(i)->SetName(b);
-
-      /*
-      AudioChannelLayout layout;
-      memset(&layout, 0, sizeof(layout));
-      layout.mNumberChannelDescriptions = 1;
-      layout.mChannelLayoutTag = kAudioChannelLayoutTag_Stereo;
-      Outputs().GetIOElement(i)->SetAudioChannelLayout(layout);
-      */
+      addAudioBusFrom(i, &inf, false);
     }
     LOGINFO("[clap-wrapper] PostConstructor: Ins={} Outs={}", numAudioInputs, numAudioOutputs);
   }
