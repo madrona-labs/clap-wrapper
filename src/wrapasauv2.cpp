@@ -9,7 +9,11 @@ extern bool fillAudioUnitCocoaView(AudioUnitCocoaViewInfo *viewInfo, std::shared
 namespace free_audio::auv2_wrapper
 {
 
-Clap::Library _library;  // holds the library with plugins
+// Intentionally leaked (never destructed). A host may dlclose this AU module
+// before process exit, unmapping our code; a namespace-global with a non-trivial
+// destructor would register an __cxa_atexit dtor that then fires against unmapped
+// memory at exit() and segfaults. The reference keeps every use site unchanged.
+Clap::Library& _library = *(new Clap::Library());  // holds the library with plugins
 
 #if 0
 --- 8< ---
