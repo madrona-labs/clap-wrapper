@@ -130,9 +130,15 @@ IPluginFactory *GetPluginFactoryEntryPoint()
 #endif
 
   // static IPtr<Steinberg::CPluginFactory> gPluginFactory = nullptr;
-  static Clap::Library gClapLibrary;
+  // Intentionally leaked (never destructed). A host may dlclose this VST3 module
+  // before process exit (e.g. Steinberg's validator releases its LinuxModule at
+  // the end of run()), unmapping our code. A function-local static would register
+  // an __cxa_atexit destructor that then fires against unmapped memory at exit()
+  // and segfaults. References keep every use site below unchanged.
+  static Clap::Library& gClapLibrary = *(new Clap::Library());
 
-  static std::vector<std::shared_ptr<CreationContext>> gCreationContexts;
+  static std::vector<std::shared_ptr<CreationContext>>& gCreationContexts =
+      *(new std::vector<std::shared_ptr<CreationContext>>());
 
   // if there is no ClapLibrary yet
   if (!gClapLibrary._pluginFactory)
