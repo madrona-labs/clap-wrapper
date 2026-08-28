@@ -408,6 +408,91 @@ tresult PLUGIN_API ClapAsVst3::setProcessing(TBool state)
   return result;
 }
 
+// inverse of vst3SpeakerFromClapSurround; -1 if the speaker has no CLAP equivalent
+static int clapSurroundChannelFromVst3Speaker(Vst::Speaker speaker)
+{
+  switch (speaker)
+  {
+    case Vst::kSpeakerL:
+      return CLAP_SURROUND_FL;
+    case Vst::kSpeakerR:
+      return CLAP_SURROUND_FR;
+    case Vst::kSpeakerC:
+      return CLAP_SURROUND_FC;
+    case Vst::kSpeakerLfe:
+      return CLAP_SURROUND_LFE;
+    case Vst::kSpeakerLs:
+      return CLAP_SURROUND_BL;
+    case Vst::kSpeakerRs:
+      return CLAP_SURROUND_BR;
+    case Vst::kSpeakerLc:
+      return CLAP_SURROUND_FLC;
+    case Vst::kSpeakerRc:
+      return CLAP_SURROUND_FRC;
+    case Vst::kSpeakerCs:
+      return CLAP_SURROUND_BC;
+    case Vst::kSpeakerSl:
+      return CLAP_SURROUND_SL;
+    case Vst::kSpeakerSr:
+      return CLAP_SURROUND_SR;
+    case Vst::kSpeakerTc:
+      return CLAP_SURROUND_TC;
+    case Vst::kSpeakerTfl:
+      return CLAP_SURROUND_TFL;
+    case Vst::kSpeakerTfc:
+      return CLAP_SURROUND_TFC;
+    case Vst::kSpeakerTfr:
+      return CLAP_SURROUND_TFR;
+    case Vst::kSpeakerTrl:
+      return CLAP_SURROUND_TBL;
+    case Vst::kSpeakerTrc:
+      return CLAP_SURROUND_TBC;
+    case Vst::kSpeakerTrr:
+      return CLAP_SURROUND_TBR;
+    case Vst::kSpeakerTsl:
+      return CLAP_SURROUND_TSL;
+    case Vst::kSpeakerTsr:
+      return CLAP_SURROUND_TSR;
+    default:
+      return -1;
+  }
+}
+
+// channels are emitted in ascending speaker-bit order, the channel order within a VST3 bus.
+// false if any speaker has no CLAP equivalent, i.e. the arrangement isn't expressible.
+static bool clapSurroundChannelMapFromVst3(Vst::SpeakerArrangement arr, std::vector<uint8_t> &outMap,
+                                           uint64_t &outMask)
+{
+  outMap.clear();
+  outMask = 0;
+  for (int bit = 0; bit < 64; ++bit)
+  {
+    auto speaker = (Vst::Speaker)(uint64_t(1) << bit);
+    if (arr & speaker)
+    {
+      auto ch = clapSurroundChannelFromVst3Speaker(speaker);
+      if (ch < 0) return false;
+      outMap.push_back((uint8_t)ch);
+      outMask |= (uint64_t(1) << ch);
+    }
+  }
+  return true;
+}
+
+// surround ports validate the exact channel mask; anything else just matches channel count
+static bool clapAcceptsVst3Arrangement(const Clap::Plugin *plugin, Vst::SpeakerArrangement arr,
+                                       const clap_audio_port_info_t &info)
+{
+  if (plugin->_ext._surround && info.port_type && !strcmp(info.port_type, CLAP_PORT_SURROUND))
+  {
+    std::vector<uint8_t> map;
+    uint64_t mask = 0;
+    if (!clapSurroundChannelMapFromVst3(arr, map, mask)) return false;
+    return plugin->_ext._surround->is_channel_mask_supported(plugin->_plugin, mask);
+  }
+  return static_cast<uint32_t>(Vst::SpeakerArr::getChannelCount(arr)) == info.channel_count;
+}
+
 tresult PLUGIN_API ClapAsVst3::setBusArrangements(Vst::SpeakerArrangement *inputs, int32 numIns,
                                                   Vst::SpeakerArrangement *outputs, int32 numOuts)
 {
@@ -422,6 +507,10 @@ tresult PLUGIN_API ClapAsVst3::setBusArrangements(Vst::SpeakerArrangement *input
   if (_plugin->_ext._configurable_audio_ports)
   {
     std::vector<clap_audio_port_configuration_request_t> requests;
+    // backing storage for the channel maps referenced by request.port_details
+    std::vector<std::vector<uint8_t>> channelMaps;
+    requests.reserve(numIns + numOuts);
+    channelMaps.reserve(numIns + numOuts);
 
     for (int i = 0; i < numIns + numOuts; ++i)
     {
@@ -430,6 +519,8 @@ tresult PLUGIN_API ClapAsVst3::setBusArrangements(Vst::SpeakerArrangement *input
       request.is_input = i < numIns;
       request.port_index = i < numIns ? i : (i - numIns);
       auto arrangement = i < numIns ? inputs[i] : outputs[i - numIns];
+
+      auto &channelMap = channelMaps.emplace_back();
 
       switch (arrangement)
       {
@@ -447,6 +538,17 @@ tresult PLUGIN_API ClapAsVst3::setBusArrangements(Vst::SpeakerArrangement *input
           request.channel_count = static_cast<uint32_t>(Vst::SpeakerArr::getChannelCount(arrangement));
           request.port_type = nullptr;
           request.port_details = nullptr;
+          // ask for an explicit channel map so the plugin gets the exact channels, not just N
+          if (_plugin->_ext._surround)
+          {
+            uint64_t mask = 0;
+            if (clapSurroundChannelMapFromVst3(arrangement, channelMap, mask) &&
+                _plugin->_ext._surround->is_channel_mask_supported(_plugin->_plugin, mask))
+            {
+              request.port_type = CLAP_PORT_SURROUND;
+              request.port_details = channelMap.data();
+            }
+          }
           break;
       }
 
@@ -471,16 +573,14 @@ tresult PLUGIN_API ClapAsVst3::setBusArrangements(Vst::SpeakerArrangement *input
     {
       clap_audio_port_info_t info;
       _plugin->_ext._audioports->get(_plugin->_plugin, i, true, &info);
-      if (static_cast<uint32_t>(Vst::SpeakerArr::getChannelCount(inputs[i])) != info.channel_count)
-        return kResultFalse;
+      if (!clapAcceptsVst3Arrangement(_plugin.get(), inputs[i], info)) return kResultFalse;
     }
 
     for (int i = 0; i < numOuts; ++i)
     {
       clap_audio_port_info_t info;
       _plugin->_ext._audioports->get(_plugin->_plugin, i, false, &info);
-      if (static_cast<uint32_t>(Vst::SpeakerArr::getChannelCount(outputs[i])) != info.channel_count)
-        return kResultFalse;
+      if (!clapAcceptsVst3Arrangement(_plugin.get(), outputs[i], info)) return kResultFalse;
     }
   }
 
@@ -798,7 +898,56 @@ ARAPlugInExtensionInstancePtr PLUGIN_API ClapAsVst3::bindToDocumentControllerWit
   return nullptr;
 }
 
-// TODO: surround extension support
+// maps a single CLAP surround channel identifier to the corresponding VST3 speaker bit
+static Vst::Speaker vst3SpeakerFromClapSurround(uint8_t channel)
+{
+  switch (channel)
+  {
+    case CLAP_SURROUND_FL:
+      return Vst::kSpeakerL;
+    case CLAP_SURROUND_FR:
+      return Vst::kSpeakerR;
+    case CLAP_SURROUND_FC:
+      return Vst::kSpeakerC;
+    case CLAP_SURROUND_LFE:
+      return Vst::kSpeakerLfe;
+    case CLAP_SURROUND_BL:
+      return Vst::kSpeakerLs;
+    case CLAP_SURROUND_BR:
+      return Vst::kSpeakerRs;
+    case CLAP_SURROUND_FLC:
+      return Vst::kSpeakerLc;
+    case CLAP_SURROUND_FRC:
+      return Vst::kSpeakerRc;
+    case CLAP_SURROUND_BC:
+      return Vst::kSpeakerCs;
+    case CLAP_SURROUND_SL:
+      return Vst::kSpeakerSl;
+    case CLAP_SURROUND_SR:
+      return Vst::kSpeakerSr;
+    case CLAP_SURROUND_TC:
+      return Vst::kSpeakerTc;
+    case CLAP_SURROUND_TFL:
+      return Vst::kSpeakerTfl;
+    case CLAP_SURROUND_TFC:
+      return Vst::kSpeakerTfc;
+    case CLAP_SURROUND_TFR:
+      return Vst::kSpeakerTfr;
+    case CLAP_SURROUND_TBL:
+      return Vst::kSpeakerTrl;
+    case CLAP_SURROUND_TBC:
+      return Vst::kSpeakerTrc;
+    case CLAP_SURROUND_TBR:
+      return Vst::kSpeakerTrr;
+    case CLAP_SURROUND_TSL:
+      return Vst::kSpeakerTsl;
+    case CLAP_SURROUND_TSR:
+      return Vst::kSpeakerTsr;
+    default:
+      return 0;  // no speaker bit, so an unknown channel drops out of the arrangement
+  }
+}
+
 static Vst::SpeakerArrangement speakerArrFromPortType(const char *port_type, uint32_t channel_count)
 {
   if (!port_type)
@@ -840,9 +989,28 @@ static Vst::SpeakerArrangement speakerArrFromPortType(const char *port_type, uin
   return Vst::SpeakerArr::kEmpty;
 }
 
-void ClapAsVst3::addAudioBusFrom(const clap_audio_port_info_t *info, bool is_input)
+void ClapAsVst3::addAudioBusFrom(const clap_audio_port_info_t *info, uint32_t index, bool is_input)
 {
-  auto spk = speakerArrFromPortType(info->port_type, info->channel_count);
+  Vst::SpeakerArrangement spk;
+
+  // for a surround port, build the arrangement from the channel map rather than the channel
+  // count -- the only way to express e.g. quad (L/R/Ls/Rs) rather than the first four bits
+  uint8_t channelmap[sizeof(Vst::SpeakerArrangement) * 8]{};
+  if (_plugin->_ext._surround && info->port_type && !strcmp(info->port_type, CLAP_PORT_SURROUND) &&
+      info->channel_count <= sizeof(channelmap))
+  {
+    auto count = _plugin->_ext._surround->get_channel_map(_plugin->_plugin, is_input, index, channelmap,
+                                                          info->channel_count);
+    spk = Vst::SpeakerArr::kEmpty;
+    for (uint32_t c = 0; c < count; ++c)
+    {
+      spk |= vst3SpeakerFromClapSurround(channelmap[c]);
+    }
+  }
+  else
+  {
+    spk = speakerArrFromPortType(info->port_type, info->channel_count);
+  }
 
   auto bustype = Vst::BusTypes::kMain;  // actually, everything is main, except
   if (is_input && !(info->flags & CLAP_AUDIO_PORT_IS_MAIN))
@@ -1038,7 +1206,7 @@ void ClapAsVst3::setupAudioBusses(const clap_plugin_t *plugin,
     clap_audio_port_info_t info;
     if (audioports->get(plugin, i, true, &info))
     {
-      addAudioBusFrom(&info, true);
+      addAudioBusFrom(&info, (uint32_t)i, true);
     }
   }
   for (decltype(numAudioOutputs) i = 0; i < numAudioOutputs; ++i)
@@ -1046,7 +1214,7 @@ void ClapAsVst3::setupAudioBusses(const clap_plugin_t *plugin,
     clap_audio_port_info_t info;
     if (audioports->get(plugin, i, false, &info))
     {
-      addAudioBusFrom(&info, false);
+      addAudioBusFrom(&info, (uint32_t)i, false);
     }
   }
 

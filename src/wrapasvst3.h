@@ -377,7 +377,7 @@ class ClapAsVst3 : public Steinberg::Vst::SingleComponentEffect,
 
  private:
   // helper functions
-  void addAudioBusFrom(const clap_audio_port_info_t *info, bool is_input);
+  void addAudioBusFrom(const clap_audio_port_info_t *info, uint32_t index, bool is_input);
   void addMIDIBusFrom(const clap_note_port_info_t *info, uint32_t index, bool is_input);
   void updateAudioBusses();
 
