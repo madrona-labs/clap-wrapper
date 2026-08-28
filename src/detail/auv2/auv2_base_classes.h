@@ -790,6 +790,25 @@ class WrapAsAUV2 : public ausdk::AUBase,
   std::vector<AudioPortCache> _inputPortCache;
   std::vector<AudioPortCache> _outputPortCache;
 
+  // Main-port channel pairs the CLAP told us it can switch to through
+  // clap.configurable-audio-ports. Probed once in PostConstructor while the
+  // plugin is still deactivated (the extension is [main-thread && !active]),
+  // then advertised via SupportedNumChannels / ValidFormat and applied in
+  // Initialize(), the last point at which the CLAP is guaranteed inactive.
+  struct ChannelConfig
+  {
+    uint32_t inChannels;
+    uint32_t outChannels;
+  };
+  std::vector<ChannelConfig> _acceptedConfigs;
+  // element index of the main port in each scope, -1 when the scope has none
+  int _mainInputPort = -1;
+  int _mainOutputPort = -1;
+  void probeChannelConfigs();
+  bool applyChannelConfig(uint32_t inChannels, uint32_t outChannels);
+  uint32_t makeConfigRequests(uint32_t inChannels, uint32_t outChannels,
+                              clap_audio_port_configuration_request_t *requests) const;
+
   uint32_t _midi_preferred_dialect = 0;
   uint32_t _midi_supported_dialects = 0;
   bool _midi_wants_midi_input = false;  // takes any input
