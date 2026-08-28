@@ -205,6 +205,20 @@ OSStatus WrapAsAUV2::Initialize()
   // CLAP does not want it, therefore the wrapper insists on being in the
   // main thread
   auto guarantee_mainthread = _plugin->AlwaysMainThread();
+
+  // The host has finished negotiating stream formats. If the main ports ended
+  // up on a width other than the one the CLAP currently declares, switch the
+  // CLAP now -- it is still deactivated here, which the extension requires.
+  if (_mainInputPort >= 0 && _mainOutputPort >= 0 && !_acceptedConfigs.empty())
+  {
+    const uint32_t wantIn = Input(_mainInputPort).GetStreamFormat().mChannelsPerFrame;
+    const uint32_t wantOut = Output(_mainOutputPort).GetStreamFormat().mChannelsPerFrame;
+    if (!applyChannelConfig(wantIn, wantOut))
+    {
+      LOGINFO("[clap-wrapper] Initialize: CLAP refused {} in / {} out", wantIn, wantOut);
+      return kAudioUnitErr_FormatNotSupported;
+    }
+  }
   activateCLAP();
 
 #if 0
@@ -1596,7 +1610,19 @@ bool WrapAsAUV2::ValidFormat(AudioUnitScope inScope, AudioUnitElement inElement,
     }
     return true;
   }
-  return inNewFormat.mChannelsPerFrame == cache[inElement].channelCount;
+  if (inNewFormat.mChannelsPerFrame == cache[inElement].channelCount) return true;
+
+  // Widths the CLAP agreed to switch its main port to (probed in PostConstructor).
+  const int mainPort = (inScope == kAudioUnitScope_Input) ? _mainInputPort : _mainOutputPort;
+  if ((int)inElement == mainPort)
+  {
+    for (const auto &c : _acceptedConfigs)
+    {
+      const uint32_t width = (inScope == kAudioUnitScope_Input) ? c.inChannels : c.outChannels;
+      if (inNewFormat.mChannelsPerFrame == width) return true;
+    }
+  }
+  return false;
 }
 
 OSStatus WrapAsAUV2::ChangeStreamFormat(AudioUnitScope inScope, AudioUnitElement inElement,
@@ -1652,6 +1678,20 @@ UInt32 WrapAsAUV2::SupportedNumChannels(const AUChannelInfo **outInfo)
         cinfo.back().outChannels = ov;
       }
     }
+
+    // Alternatives the CLAP accepts through clap.configurable-audio-ports.
+    for (const auto &c : _acceptedConfigs)
+    {
+      bool known = false;
+      for (const auto &ci : cinfo)
+        known |= (ci.inChannels == (SInt16)c.inChannels && ci.outChannels == (SInt16)c.outChannels);
+      if (!known)
+      {
+        cinfo.emplace_back();
+        cinfo.back().inChannels = (SInt16)c.inChannels;
+        cinfo.back().outChannels = (SInt16)c.outChannels;
+      }
+    }
   }
 
   if (!outInfo) return (UInt32)cinfo.size();
@@ -1679,6 +1719,7 @@ void WrapAsAUV2::PostConstructor()
       clap_audio_port_info inf;
       ap->get(pl, i, true, &inf);
       _inputPortCache.push_back({inf.channel_count, (inf.flags & CLAP_AUDIO_PORT_IS_MAIN) != 0});
+      if (inf.flags & CLAP_AUDIO_PORT_IS_MAIN) _mainInputPort = i;
       // SetNumberOfElements resets the bus, reapply the configuration.
       addInputBus(i, &inf);
 
@@ -1698,6 +1739,7 @@ void WrapAsAUV2::PostConstructor()
       clap_audio_port_info inf;
       ap->get(pl, i, false, &inf);
       _outputPortCache.push_back({inf.channel_count, (inf.flags & CLAP_AUDIO_PORT_IS_MAIN) != 0});
+      if (inf.flags & CLAP_AUDIO_PORT_IS_MAIN) _mainOutputPort = i;
       // SetNumberOfElements resets the bus, reapply the configuration.
       addOutputBus(i, &inf);
 
@@ -1709,6 +1751,12 @@ void WrapAsAUV2::PostConstructor()
       Outputs().GetIOElement(i)->SetAudioChannelLayout(layout);
       */
     }
+
+    // AU semantics treat element 0 as the main bus when the CLAP flags none.
+    if (_mainInputPort < 0 && numAudioInputs > 0) _mainInputPort = 0;
+    if (_mainOutputPort < 0 && numAudioOutputs > 0) _mainOutputPort = 0;
+    probeChannelConfigs();
+
     LOGINFO("[clap-wrapper] PostConstructor: Ins={} Outs={}", numAudioInputs, numAudioOutputs);
   }
 
@@ -1914,6 +1962,88 @@ static uint32_t auv2SurroundChannelLabels(const std::shared_ptr<Clap::Plugin> &p
     labels[c] = auv2ChannelLabelFromClapSurround(channelmap[c]);
   }
   return count;
+}
+
+uint32_t WrapAsAUV2::makeConfigRequests(uint32_t inChannels, uint32_t outChannels,
+                                        clap_audio_port_configuration_request_t *requests) const
+{
+  // One request per main port whose width would change; unchanged ports are
+  // left out so a plugin sees only the delta.
+  auto portType = [](uint32_t n) -> const char * {
+    if (n == 1) return CLAP_PORT_MONO;
+    if (n == 2) return CLAP_PORT_STEREO;
+    return nullptr;
+  };
+  uint32_t n = 0;
+  if (_mainInputPort >= 0 && _inputPortCache[_mainInputPort].channelCount != inChannels)
+  {
+    requests[n++] = {true, (uint32_t)_mainInputPort, inChannels, portType(inChannels), nullptr};
+  }
+  if (_mainOutputPort >= 0 && _outputPortCache[_mainOutputPort].channelCount != outChannels)
+  {
+    requests[n++] = {false, (uint32_t)_mainOutputPort, outChannels, portType(outChannels), nullptr};
+  }
+  return n;
+}
+
+void WrapAsAUV2::probeChannelConfigs()
+{
+  _acceptedConfigs.clear();
+  auto cfg = _plugin->_ext._configurable_audio_ports;
+  if (!cfg || _mainInputPort < 0 || _mainOutputPort < 0) return;
+
+  const uint32_t curIn = _inputPortCache[_mainInputPort].channelCount;
+  const uint32_t curOut = _outputPortCache[_mainOutputPort].channelCount;
+  // Seed the CLAP-declared pair so ValidFormat / SupportedNumChannels always
+  // accept it, even after applyChannelConfig overwrites the port cache with a
+  // different negotiated width.
+  _acceptedConfigs.push_back({curIn, curOut});
+  auto mt = _plugin->AlwaysMainThread();
+
+  // The AU channel-info model only needs the mono/stereo alternatives on the
+  // main ports; anything wider stays whatever the CLAP declared.
+  const uint32_t candidatesIn[] = {1, 2, curIn};
+  const uint32_t candidatesOut[] = {1, 2, curOut};
+  for (auto in : candidatesIn)
+  {
+    for (auto out : candidatesOut)
+    {
+      if (in == curIn && out == curOut) continue;
+      bool known = false;
+      for (const auto &c : _acceptedConfigs) known |= (c.inChannels == in && c.outChannels == out);
+      if (known) continue;
+
+      clap_audio_port_configuration_request_t requests[2];
+      const uint32_t n = makeConfigRequests(in, out, requests);
+      if (n > 0 && cfg->can_apply_configuration(_plugin->_plugin, requests, n))
+      {
+        _acceptedConfigs.push_back({in, out});
+        LOGINFO("[clap-wrapper] PostConstructor: CLAP accepts {} in / {} out", in, out);
+      }
+    }
+  }
+}
+
+bool WrapAsAUV2::applyChannelConfig(uint32_t inChannels, uint32_t outChannels)
+{
+  if (_mainInputPort < 0 || _mainOutputPort < 0) return true;
+  auto &inCache = _inputPortCache[_mainInputPort];
+  auto &outCache = _outputPortCache[_mainOutputPort];
+  if (inCache.channelCount == inChannels && outCache.channelCount == outChannels) return true;
+
+  auto cfg = _plugin->_ext._configurable_audio_ports;
+  if (!cfg) return false;
+
+  clap_audio_port_configuration_request_t requests[2];
+  const uint32_t n = makeConfigRequests(inChannels, outChannels, requests);
+  if (n == 0) return true;
+  if (!cfg->apply_configuration(_plugin->_plugin, requests, n)) return false;
+
+  // The CLAP's ports now have the negotiated widths; keep the snapshot honest
+  // for ValidFormat and for activateCLAP's live port count.
+  inCache.channelCount = inChannels;
+  outCache.channelCount = outChannels;
+  return true;
 }
 
 UInt32 WrapAsAUV2::GetAudioChannelLayout(AudioUnitScope scope, AudioUnitElement element,
