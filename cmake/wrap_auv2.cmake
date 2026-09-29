@@ -276,11 +276,37 @@ function(target_add_auv2_wrapper)
             MACOSX_BUNDLE_SHORT_VERSION_STRING ${AUV2_BUNDLE_VERSION}
             )
 
-    # This is "PRE_BUILD" because the target is created at cmake time and we want to beat xcode signing in order
-    # it is *not* a MACOSX_BUNDLE_INFO_PLIST since that is a configure not build time concept so doesn't work
-    # with compile time generated files
-    add_custom_command(TARGET ${AUV2_TARGET} PRE_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy ${bhtgoutdir}/auv2_Info.plist $<TARGET_FILE_DIR:${AUV2_TARGET}>/../Info.plist)
+    # The real Info.plist is written by the build helper at build time, so it can't be a
+    # MACOSX_BUNDLE_INFO_PLIST (a configure time concept). But a BUNDLE target without one
+    # still gets CMake's default plist, which has no AudioComponents, so no host registers
+    # the AU. Each generator writes that default at a different time, so each needs the
+    # real plist to be a tracked build input rather than a one-off copy.
+    if (${CMAKE_GENERATOR} STREQUAL "Xcode")
+        # Xcode writes the default plist while building the target, after any PRE_BUILD
+        # step and before signing. Hand it the build helper's plist to process instead.
+        set_target_properties(${AUV2_TARGET} PROPERTIES XCODE_ATTRIBUTE_INFOPLIST_FILE "${bhtgoutdir}/auv2_Info.plist")
+    else()
+        # Ninja and Makefiles write the default plist into the bundle at generate time,
+        # on every reconfigure, and nothing in the build graph notices. So copy the real
+        # plist through a stamp that every configure deletes, and relink when the stamp
+        # changes so POST_BUILD steps that patch or sign the bundle run again. The stamp
+        # is a source of the AUv2 target itself: in a separate target, the bundle path
+        # genex would depend back on the AUv2 target in projects older than CMP0112.
+        set(plist_stamp_dir "${CMAKE_CURRENT_BINARY_DIR}/${AUV2_TARGET}-info-plist")
+        set(plist_stamp "${plist_stamp_dir}/$<CONFIG>.stamp")
+        file(REMOVE_RECURSE "${plist_stamp_dir}")
+        # Makefiles, unlike Ninja, don't create the directory of a custom command's OUTPUT.
+        add_custom_command(
+            OUTPUT "${plist_stamp}"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_BUNDLE_CONTENT_DIR:${AUV2_TARGET}>" "${plist_stamp_dir}"
+            COMMAND ${CMAKE_COMMAND} -E copy "${bhtgoutdir}/auv2_Info.plist" "$<TARGET_BUNDLE_CONTENT_DIR:${AUV2_TARGET}>/Info.plist"
+            COMMAND ${CMAKE_COMMAND} -E touch "${plist_stamp}"
+            DEPENDS "${bhtgoutdir}/auv2_Info.plist"
+            COMMENT "clap-wrapper: restoring the generated Info.plist in ${AUV2_OUTPUT_NAME}.component"
+            VERBATIM)
+        target_sources(${AUV2_TARGET} PRIVATE "${plist_stamp}")
+        set_property(TARGET ${AUV2_TARGET} APPEND PROPERTY LINK_DEPENDS "${plist_stamp}")
+    endif()
 
     # XCode needs a special extra flag
     set_target_properties(${AUV2_TARGET} PROPERTIES XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "${AUV2_BUNDLE_IDENTIFIER}.component")
