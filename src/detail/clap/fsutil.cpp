@@ -75,11 +75,48 @@ std::vector<fs::path> getValidCLAPSearchPaths()
 #endif
 
 #if LIN
+  // Check for embedded CLAP in VST3 bundle (Contents/PlugIns/)
+  {
+    auto pluginPath = os::getPluginPath();
+    if (!pluginPath.empty())
+    {
+      // VST3 structure: PluginName.vst3/Contents/{arch}-linux/binary.so
+      // Navigate up 3 levels to bundle root, then into Contents/PlugIns
+      auto bundleRoot = pluginPath.parent_path().parent_path().parent_path();
+      if (bundleRoot.extension() == ".vst3")
+      {
+        auto pluginsPath = bundleRoot / "Contents" / "PlugIns";
+        if (fs::exists(pluginsPath))
+        {
+          res.emplace_back(pluginsPath);
+        }
+      }
+    }
+  }
   res.emplace_back("/usr/lib/clap");
   res.emplace_back(fs::path(getenv("HOME")) / fs::path(".clap"));
 #endif
 
 #if WIN
+  // Check for embedded CLAP in VST3 bundle (Contents/PlugIns/)
+  {
+    auto pluginPath = os::getPluginPath();
+    if (!pluginPath.empty())
+    {
+      // VST3 structure: PluginName.vst3/Contents/{arch}-win/binary.vst3
+      // Navigate up 3 levels to bundle root, then into Contents/PlugIns
+      auto bundleRoot = pluginPath.parent_path().parent_path().parent_path();
+      if (bundleRoot.extension() == ".vst3")
+      {
+        auto pluginsPath = bundleRoot / "Contents" / "PlugIns";
+        if (fs::exists(pluginsPath))
+        {
+          res.emplace_back(pluginsPath);
+        }
+      }
+    }
+  }
+
   auto p{get_known_folder(FOLDERID_ProgramFilesCommon)};
   if (fs::exists(p)) res.emplace_back(p / "CLAP");
 
@@ -109,7 +146,7 @@ std::vector<fs::path> getValidCLAPSearchPaths()
   }
   auto sep = ':';
 
-  if (cp.empty())
+  if (!cp.empty())
   {
     size_t pos;
     while ((pos = cp.find(sep)) != std::string::npos)
